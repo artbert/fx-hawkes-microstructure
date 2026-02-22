@@ -1,0 +1,8 @@
+hawkes
+pandas
+numpy
+matplotlib
+seaborn
+scipy
+fastparquet
+notebook

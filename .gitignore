@@ -1,0 +1,14 @@
+# Data
+data/*.csv
+data/*.parquet
+!data/samples/  # jeśli chcesz zostawić małe próbki dla rekrutera
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints
