@@ -7,32 +7,52 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import datetime
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any
 from scipy.optimize import minimize
 import Hawkes as hk
+from enum import Enum, auto
 
 # Global Plotting Settings
-sns.set(style="whitegrid")
+sns.set_theme(style="whitegrid")
 
 # --- DATA PREPARATION ---
 
-def exclude_midnight(
-    df: pd.DataFrame,
-    start_time: datetime.time,
-    end_time: datetime.time
-) -> pd.DataFrame:
-    """Filters out low-liquidity periods (e.g., rollover) from the dataset."""
-    df = df.copy()
-    mask_to_exclude = (df['timestamp'].dt.time >= start_time) | (df['timestamp'].dt.time <= end_time)
-    return df[~mask_to_exclude].reset_index(drop=True)
+class DataFormat(Enum):
+    METATRADER = auto()
+    DUKASCOPY = auto()
+    UNKNOWN = auto()
 
+def detect_file_info(path: str) -> tuple[DataFormat, str, str]:
+    """
+    Rozpoznaje format, separator oraz kodowanie pliku.
+    Zwraca: (DataFormat, separator, encoding)
+    """
+    # Najpierw sprawdzamy surowe bajty pod kątem BOM (Byte Order Mark)
+    with open(path, 'rb') as f:
+        raw_start = f.read(100)
+    
+    # UTF-16 LE BOM to b'\xff\xfe'
+    if raw_start.startswith(b'\xff\xfe'):
+        encoding = 'utf-16'
+        # Dekodujemy fragment do testu nagłówka
+        header_sample = raw_start.decode('utf-16')
+    else:
+        encoding = 'utf-8'
+        header_sample = raw_start.decode('utf-8', errors='ignore')
+
+    # Teraz sprawdzamy zawartość nagłówka
+    if '<DATE>\t<TIME>' in header_sample:
+        return DataFormat.METATRADER, '\t', encoding
+    elif 'UTC,Ask,Bid' in header_sample:
+        return DataFormat.DUKASCOPY, ',', encoding
+    
+    return DataFormat.UNKNOWN, ',', encoding
+    
 def load_and_prepare(
     path: str,
     drop_rollover: bool = True,
     rollover_start: str = '23:00',
-    rollover_end: str = '01:15',
-    sep: str = '\t'
+    rollover_end: str = '01:15'
 ) -> pd.DataFrame:
     """
     Loads raw tick data and performs initial cleaning.
@@ -42,17 +62,48 @@ def load_and_prepare(
         drop_rollover: Whether to remove low-liquidity midnight periods.
         rollover_start: Start of exclusion period.
         rollover_end: End of exclusion period.
-        sep: CSV separator.
     """
-    df = pd.read_csv(path, sep=sep)
-    expected = {'<DATE>', '<TIME>', '<BID>', '<ASK>'}
 
-    if not expected.issubset(set(df.columns)):
-        raise ValueError(f"Missing expected columns. Found: {df.columns.tolist()}")
+    # Automatic detection
+    fmt, separator, enc = detect_file_info(path)
+    
+    if fmt == DataFormat.UNKNOWN:
+        raise ValueError(f"Unknown file format: {path}")
+        
+    # Reading with detected separator
+    df = pd.read_csv(path, sep=separator, encoding=enc)
 
-    # Standardize column names
-    df = df.rename(columns={'<DATE>':'date', '<TIME>':'time', '<BID>':'bid', '<ASK>':'ask'})
-    df['timestamp'] = pd.to_datetime(df['date'].astype(str) + ' ' + df['time'])
+    if drop_rollover:
+        # Temporary column with only time (still in server/local time)
+        if fmt == DataFormat.METATRADER:
+            temp_time = pd.to_datetime(df['<TIME>'], format="%H:%M:%S.%f").dt.time
+        else:
+            temp_time = pd.to_datetime(df['UTC'], format="%Y.%m.%d %H:%M:%S.%f").dt.time
+
+        start_t = pd.to_datetime(rollover_start, format="%H:%M").time()
+        end_t = pd.to_datetime(rollover_end, format="%H:%M").time()
+
+        if start_t > end_t:
+            mask = (temp_time >= start_t) | (temp_time <= end_t)
+        else:
+            mask = (temp_time >= start_t) & (temp_time <= end_t)
+        
+        df = df[~mask].reset_index(drop=True)
+    
+    if fmt == DataFormat.METATRADER:
+        # Date and time concatenation
+        ts_raw = pd.to_datetime(df['<DATE>'].astype(str) + ' ' + df['<TIME>'], format="%Y.%m.%d %H:%M:%S.%f")
+        # Convert to UTC
+        df['timestamp'] = ts_raw.dt.tz_localize("EET", ambiguous='infer').dt.tz_convert("UTC")
+        # Rename
+        df = df.rename(columns={'<BID>': 'bid', '<ASK>': 'ask'})
+        
+    elif fmt == DataFormat.DUKASCOPY:
+        # We remove the ' UTC' text before conversion to have a clean timestamp
+        clean_date = df['UTC'].str.replace(' UTC', '', regex=False)
+        df['timestamp'] = pd.to_datetime(clean_date, format="%d.%m.%Y %H:%M:%S.%f").dt.tz_localize("UTC")
+        
+        df = df.rename(columns={'Bid': 'bid', 'Ask': 'ask'})
 
     # Preserve raw values for point process identification
     df['bid_raw'] = df['bid']
@@ -61,11 +112,6 @@ def load_and_prepare(
     # Forward-fill quotes for mid-price/spread calculations
     df['bid'] = df['bid_raw'].ffill()
     df['ask'] = df['ask_raw'].ffill()
-
-    if drop_rollover:
-        start = pd.to_datetime(rollover_start).time()
-        end = pd.to_datetime(rollover_end).time()
-        df = exclude_midnight(df, start, end)
 
     df = df.sort_values('timestamp').reset_index(drop=True)
     return df[['timestamp', 'bid_raw', 'ask_raw', 'bid', 'ask']]
