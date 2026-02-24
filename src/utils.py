@@ -56,6 +56,8 @@ def load_and_prepare(
 ) -> pd.DataFrame:
     """
     Loads raw tick data and performs initial cleaning.
+    Rollover periods are in EET time zone:
+    '00:00' is equivalent to '17:00' (rollover) in New York time zone.
 
     Args:
         path: Path to the CSV file.
@@ -76,13 +78,27 @@ def load_and_prepare(
     if drop_rollover:
         # Temporary column with only time (still in server/local time)
         if fmt == DataFormat.METATRADER:
-            temp_time = pd.to_datetime(df['<TIME>'], format="%H:%M:%S.%f").dt.time
+            temp_time = pd.to_datetime(df['<TIME>'].str.slice(0,8), format="%H:%M:%S").dt.time
+            
+            start_t = pd.to_datetime(rollover_start, format="%H:%M").time()
+            end_t = pd.to_datetime(rollover_end, format="%H:%M").time()
         else:
-            temp_time = pd.to_datetime(df['UTC'], format="%Y.%m.%d %H:%M:%S.%f").dt.time
-
-        start_t = pd.to_datetime(rollover_start, format="%H:%M").time()
-        end_t = pd.to_datetime(rollover_end, format="%H:%M").time()
-
+            times = df['UTC'].str.split(' ').str[1].str[:8] # wycina "HH:MM:SS"
+            temp_time = pd.to_datetime(times, format='%H:%M:%S').dt.time
+            
+            raw_sample = df['UTC'].iloc[0]
+            date_part = raw_sample.split(' ')[0] 
+            reference_date = pd.to_datetime(date_part, dayfirst=True)
+            logic_tz = 'EET' # default tz
+            data_tz = 'UTC'  # Dukascopy tz
+            start_dt = reference_date.tz_localize(logic_tz) + pd.to_timedelta(rollover_start + ":00")
+            end_dt = reference_date.tz_localize(logic_tz) + pd.to_timedelta(rollover_end + ":00")
+            if end_dt <= start_dt:
+                end_dt += pd.Timedelta(days=1)
+            start_t = start_dt.tz_convert(data_tz).time()
+            end_t = end_dt.tz_convert(data_tz).time()
+            
+            
         if start_t > end_t:
             mask = (temp_time >= start_t) | (temp_time <= end_t)
         else:
